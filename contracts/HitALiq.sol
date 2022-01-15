@@ -2,20 +2,21 @@
 pragma solidity ^0.8.0;
 pragma abicoder v2;
 
-import "@uniswap/v3-periphery/contracts/libraries/TransferHelper.sol";
-import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
+import "./UniV3Swapper.sol";
 import {FlashLoanReceiverBase} from "./flash-loan/FlashLoanReceiverBase.sol";
 import {ILendingPool, ILendingPoolAddressesProvider} from "./flash-loan/Interfaces.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
 import "./squeeth/contracts/interfaces/IController.sol";
-import "./squeeth/contracts/external/WETH9.sol";
+import "./squeeth/contracts/interfaces/IWETH9.sol";
 
-contract HitALiq is FlashLoanReceiverBase {
-    IERC20 public constant WETH9 = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-    IERC20 public constant oSQTH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
-
+contract HitALiq is FlashLoanReceiverBase, UniV3Swapper {
+    IWETH9 public constant WETH9 = IWETH9(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    IERC20 public constant oSQTH = IERC20(0xf1B99e3E573A1a9C5E6B2Ce818b617F0E664E86B);
+    IController public constant sqthController = IController(0x64187ae08781B09368e6253F9E94951243A493D5);
+    IERC20 public constant PROFIT_TOKEN = IERC20(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48);
+    ISwapRouter public constant SWAP_ROUTER = ISwapRouter(0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45);
     constructor(ILendingPoolAddressesProvider _addressProvider)
-        public
         FlashLoanReceiverBase(_addressProvider)
     {}
 
@@ -25,107 +26,37 @@ contract HitALiq is FlashLoanReceiverBase {
         uint256[] calldata premiums,
         address initiator,
         bytes calldata params
-    ) external override returns (bool) {
+    ) external returns (bool) {
         // Approve the LendingPool contract allowance to *pull* the owed amount
         (
-            address swapRouter,
-            address WETH,
-            address oSQTH,
             uint24 poolFees,
-            address sqthController,
             uint256 vaultId,
-            uint256 liquiditionAmount,
             uint256 minerReward,
-            bool swapFromWETH,
-            address profitToken
-        ) = abi.decode(params, (address, address, uint24, address, uint256, uint256));
+            uint256 liquiditionAmount
+        ) = abi.decode(params, (uint24, uint256, uint256, uint256));
         require(
-            assets.length == 1 && assets[0] == WETH,
+            assets.length == 1 && assets[0] == address(WETH9),
             "Cannot borrow anything but WETH"
         );
-        uint256 ammountOwed = amounts[0] + premiums[0];
-        IERC20(assets[0]).approve(address(LENDING_POOL), ammountOwed);
-        ISwapRouter swapRouter = ISwapRouter(swapRouter);
+        uint256 debt = amounts[0] - premiums[0];
+        WETH9.approve(address(LENDING_POOL), debt);
         swapExactOutputSingle(
-            swapRouter,
-            WETH,
-            oSQTH,
+            SWAP_ROUTER,
+            address(WETH9),
+            address(oSQTH),
             poolFees,
             liquiditionAmount,
-            amounts[0]
+            ~uint256(0)
         );
-        WETH9 weth = WETH9(WETH);
-        IController(sqthController).liquidate(vaultId, liquiditionAmount);
-        weth.deposit(address(this).balance - minerReward);
-        payable(block.coinbase).sendValue(minerReward);
-        if(swapFromWETH){
-            swapExactInputSingle(swapRouter, WETH, profitToken, poolFees, address(this).balance - minerReward - ammountOwed, initializer);
-            return true;
-        } else {
-            WETH9.transfer(initializer, address(this).balance - minerReward - ammountOwed);
-        }
+        IController(sqthController).liquidate(vaultId, amounts[0]);
+        WETH9.deposit{value: address(this).balance - minerReward}();
+        block.coinbase.transfer(minerReward);
+        // if(swapFromWETH){
+            swapExactInputSingle(SWAP_ROUTER, address(WETH9), address(PROFIT_TOKEN), poolFees, address(this).balance - minerReward - debt, initiator);
+        // } else {
+        //     WETH9.transfer(initiator, address(this).balance - minerReward - amounts[0] - premiums[0]);
+        // }
         
         return true;
-    }
-
-    function swapExactInputSingle(
-            ISwapRouter swapRouter,
-            address tokenIn,
-            address tokenOut,
-            uint24 poolFees,
-            uint256 amountIn,
-            address recipient
-        ) external returns (uint256 amountOut) {
-        // Approve the router to spend DAI.
-        TransferHelper.safeApprove(tokenIn, address(swapRouter), amountIn);
-
-        // Naively set amountOutMinimum to 0. In production, use an oracle or other data source to choose a safer value for amountOutMinimum.
-        // We also set the sqrtPriceLimitx96 to be 0 to ensure we swap our exact input amount.
-        ISwapRouter.ExactInputSingleParams memory params =
-            ISwapRouter.ExactInputSingleParams({
-                tokenIn: tokenIn,
-                tokenOut: tokenOut,
-                fee: poolFees,
-                recipient: recipient,
-                deadline: block.timestamp,
-                amountIn: amountIn,
-                amountOutMinimum: 0,
-                sqrtPriceLimitX96: 0
-            });
-
-        // The call to `exactInputSingle` executes the swap.
-        amountOut = swapRouter.exactInputSingle(params);
-    }
-
-    function swapExactOutputSingle(
-        ISwapRouter swapRouter,
-        address tokenIn,
-        address tokenOut,
-        uint24 poolFees,
-        uint256 amountOut,
-        uint256 amountInMaximum
-    ) internal returns (uint256 amountIn) {
-        // Approve the router to spend the specifed `amountInMaximum` of DAI.
-        // In production, you should choose the maximum amount to spend based on oracles or other data sources to acheive a better swap.
-        TransferHelper.safeApprove(
-            tokenIn,
-            address(swapRouter),
-            amountInMaximum
-        );
-
-        ISwapRouter.ExactOutputSingleParams memory params = ISwapRouter
-            .ExactOutputSingleParams({
-                tokenIn: tokenIn,
-                tokenOut: tokenOut,
-                fee: poolFees,
-                recipient: address(this),
-                deadline: block.timestamp,
-                amountOut: amountOut,
-                amountInMaximum: amountInMaximum,
-                sqrtPriceLimitX96: 0
-            });
-
-        // Executes the swap returning the amountIn needed to spend to receive the desired amountOut.
-        amountIn = swapRouter.exactOutputSingle(params);
     }
 }
