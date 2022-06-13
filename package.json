@@ -12,5 +12,8 @@
     "hardhat": "^2.8.2",
     "hardhat-gas-reporter": "^1.0.7",
     "solidity-coverage": "^0.7.17"
+  },
+  "dependencies": {
+    "@alch/alchemy-web3": "^1.4.2"
   }
 }
